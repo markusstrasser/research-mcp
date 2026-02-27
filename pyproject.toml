@@ -1,0 +1,22 @@
+[project]
+name = "papers-mcp"
+version = "0.2.0"
+description = "Academic paper discovery, full-text extraction, and RAG via MCP"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=3.0",
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    "pymupdf>=1.25",
+    "google-genai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "respx>=0.22"]
+
+[project.scripts]
+papers-mcp = "research_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
