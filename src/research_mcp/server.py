@@ -1,16 +1,24 @@
 """Research MCP server — paper discovery, full-text RAG, and corpus management."""
 
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastmcp import FastMCP, Context
+from tenacity import RetryError
 
 from research_mcp.db import PaperDB
 from research_mcp.discovery import SemanticScholar
+from research_mcp.openalex import OpenAlex
 from research_mcp.papers import download_paper, download_url, extract_text
 from research_mcp.cag import ask_corpus
+from research_mcp.exa_verify import get_exa_client, exa_verify_claim
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 DEFAULT_SELVE_ROOT = Path.home() / "Projects" / "selve"
@@ -29,7 +37,17 @@ def create_mcp(
         pdf_dir.mkdir(parents=True, exist_ok=True)
         db = PaperDB(data_dir / "papers.db", check_same_thread=False)
         s2 = SemanticScholar(db, api_key=os.environ.get("S2_API_KEY"))
-        yield {"db": db, "s2": s2, "selve_root": selve_root, "pdf_dir": pdf_dir}
+        oa = OpenAlex(
+            db,
+            api_key=os.environ.get("OPENALEX_API_KEY"),
+            email=os.environ.get("OPENALEX_EMAIL"),
+        )
+        exa = get_exa_client()
+        if exa:
+            log.info("Exa client initialized for claim verification")
+        else:
+            log.info("No EXA_API_KEY — verify_claim will return insufficient")
+        yield {"db": db, "s2": s2, "oa": oa, "exa": exa, "selve_root": selve_root, "pdf_dir": pdf_dir}
 
     mcp = FastMCP(
         "research",
@@ -41,22 +59,72 @@ def create_mcp(
             "3. fetch_paper — download PDF and extract full text (Sci-Hub + OA)\n"
             "4. ask_corpus — ask questions against full-text papers (Gemini 1M context)\n"
             "5. list_corpus / get_paper — browse saved papers\n"
-            "6. export_for_selve — export for ./selve update to embed into unified index"
+            "6. export_for_selve — export for ./selve update to embed into unified index\n\n"
+            "Web source archiving:\n"
+            "- save_source — archive a web page (blog post, docs, news) with its content\n"
+            "- get_source — retrieve an archived web source by URL\n"
+            "- list_sources — browse archived web sources, optionally filter by domain\n\n"
+            "Claim verification:\n"
+            "- verify_claim — verify a factual claim against web sources (Exa /answer, cached 7 days)"
         ),
         lifespan=lifespan,
     )
 
     @mcp.tool()
-    def search_papers(ctx: Context, query: str, limit: int = 10) -> list[dict]:
-        """Search Semantic Scholar for papers. Returns titles, abstracts, citation counts.
+    def search_papers(
+        ctx: Context,
+        query: str,
+        limit: int = 10,
+        backend: str | None = None,
+    ) -> list[dict]:
+        """Search for papers. Returns titles, abstracts, citation counts.
 
+        Tries Semantic Scholar first, falls back to OpenAlex if S2 is rate-limited.
         Use this to discover papers on a topic. Save interesting ones with save_paper.
+
+        Args:
+            query: Search query.
+            limit: Max results (capped at 50).
+            backend: Force a backend: "s2" or "openalex". If None, tries S2 then falls back.
         """
         s2 = ctx.lifespan_context["s2"]
-        results = s2.search(query, limit=min(limit, 50))
+        oa = ctx.lifespan_context["oa"]
+        capped = min(limit, 50)
+        results = None
+        used_backend = None
+
+        if backend == "openalex":
+            try:
+                results = oa.search(query, limit=capped)
+                used_backend = "openalex"
+            except RetryError as e:
+                cause = e.last_attempt.exception() if e.last_attempt else e
+                log.warning("OpenAlex search failed: %s", cause)
+                return {"error": f"OpenAlex unavailable. ({cause})"}
+        else:
+            # Try S2 first
+            try:
+                results = s2.search(query, limit=capped)
+                used_backend = "s2"
+            except RetryError as e:
+                if backend == "s2":
+                    cause = e.last_attempt.exception() if e.last_attempt else e
+                    log.warning("S2 search failed (no fallback): %s", cause)
+                    return {"error": f"Semantic Scholar rate-limited or unavailable. ({cause})"}
+                # Fall back to OpenAlex
+                log.info("S2 search failed, falling back to OpenAlex")
+                try:
+                    results = oa.search(query, limit=capped)
+                    used_backend = "openalex"
+                except RetryError as e2:
+                    cause = e2.last_attempt.exception() if e2.last_attempt else e2
+                    log.warning("Both S2 and OpenAlex failed: %s", cause)
+                    return {"error": f"Both Semantic Scholar and OpenAlex unavailable. ({cause})"}
+
         for r in results:
             if r.get("abstract") and len(r["abstract"]) > 300:
                 r["abstract"] = r["abstract"][:300] + "..."
+        log.debug("search_papers used backend=%s, %d results", used_backend, len(results))
         return results
 
     @mcp.tool()
@@ -68,7 +136,12 @@ def create_mcp(
         """
         s2 = ctx.lifespan_context["s2"]
         db = ctx.lifespan_context["db"]
-        paper = s2.get_paper(paper_id)
+        try:
+            paper = s2.get_paper(paper_id)
+        except RetryError as e:
+            cause = e.last_attempt.exception() if e.last_attempt else e
+            log.warning("S2 get_paper failed after retries: %s", cause)
+            return {"error": f"Semantic Scholar rate-limited or unavailable. ({cause})"}
         if paper is None:
             return {"error": f"Paper {paper_id} not found on Semantic Scholar"}
         db.upsert_paper(paper)
@@ -230,6 +303,70 @@ def create_mcp(
         out = sr / "interpreted" / "research_papers_export.json"
         out.write_text(json.dumps({"entries": entries}, indent=2))
         return {"exported": len(entries), "path": str(out)}
+
+    @mcp.tool()
+    def save_source(ctx: Context, url: str, title: str, content: str) -> dict:
+        """Archive a web source (blog post, docs, news article) with its content.
+
+        Use after fetching a URL via WebFetch/Exa to persist it for later retrieval.
+        Automatically extracts domain and computes content hash.
+
+        Args:
+            url: The source URL.
+            title: Page title.
+            content: The fetched content (markdown or plain text).
+        """
+        db = ctx.lifespan_context["db"]
+        domain = urlparse(url).netloc
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        db.save_source(url, title, domain, content, content_hash)
+        return {"url": url, "title": title, "domain": domain, "chars": len(content)}
+
+    @mcp.tool()
+    def get_source(ctx: Context, url: str) -> dict:
+        """Retrieve an archived web source by URL."""
+        db = ctx.lifespan_context["db"]
+        source = db.get_source(url)
+        if source is None:
+            return {"error": f"Source not archived: {url}"}
+        return source
+
+    @mcp.tool()
+    def list_sources(ctx: Context, limit: int = 50, domain: str | None = None) -> list[dict]:
+        """List archived web sources, newest first.
+
+        Args:
+            limit: Max results (default 50).
+            domain: Optional domain filter (e.g. "arxiv.org").
+        """
+        db = ctx.lifespan_context["db"]
+        return db.list_sources(limit=limit, domain=domain)
+
+    @mcp.tool()
+    def verify_claim(ctx: Context, claim: str) -> dict:
+        """Verify a factual claim against web sources via Exa /answer.
+
+        Returns structured verdict with evidence and citations. Cached 7 days.
+        Uses Exa's web-grounded LLM — not a cross-model adversarial check.
+
+        Args:
+            claim: A specific factual claim to verify (e.g. "SpaceX was valued at $350B in Dec 2024").
+        """
+        exa = ctx.lifespan_context.get("exa")
+        db = ctx.lifespan_context["db"]
+
+        if exa is None:
+            return {
+                "verdict": "insufficient",
+                "evidence_summary": "Exa not configured — set EXA_API_KEY environment variable",
+                "confidence": 0.0,
+                "citations": [],
+                "cost_dollars": None,
+                "cached": False,
+                "error": "no_api_key",
+            }
+
+        return exa_verify_claim(claim, exa, db=db)
 
     return mcp
 
