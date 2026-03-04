@@ -9,8 +9,8 @@ from google.genai import types
 logger = logging.getLogger(__name__)
 
 # Tiered models: cheap for broad sweeps, capable for focused analysis
-MODEL_BROAD = os.environ.get("CAG_MODEL_BROAD", "gemini-2.5-flash-lite")
-MODEL_FOCUSED = os.environ.get("CAG_MODEL_FOCUSED", "gemini-2.5-flash")
+MODEL_BROAD = os.environ.get("CAG_MODEL_BROAD", "gemini-3-flash-preview")
+MODEL_FOCUSED = os.environ.get("CAG_MODEL_FOCUSED", "gemini-3-flash-preview")
 
 # ~4 chars per token on average for English text
 CHARS_PER_TOKEN = 4

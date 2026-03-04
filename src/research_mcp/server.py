@@ -252,13 +252,13 @@ def create_mcp(
 
         Stuffs all paper texts into Gemini's context window (CAG — no chunking,
         no retrieval, just the full papers). Automatically selects model tier:
-        - gemini-2.5-flash-lite for large corpus (>30 papers, cheap)
-        - gemini-2.5-flash for focused queries (<=30 papers, more capable)
+        - gemini-3-flash-preview for large corpus (>30 papers, cheap)
+        - gemini-3-flash-preview for focused queries (<=30 papers, more capable)
 
         Args:
             question: Research question. Be specific for best results.
             paper_ids: Optional list of paper IDs to query. If None, uses all papers with text.
-            model: Override model (e.g. 'gemini-2.5-flash', 'gemini-2.5-flash-lite').
+            model: Override model (e.g. 'gemini-3-flash-preview', 'gemini-3-flash-preview').
         """
         db = ctx.lifespan_context["db"]
         papers = db.get_papers_with_text(paper_ids)
