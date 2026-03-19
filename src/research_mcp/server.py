@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from fastmcp import FastMCP, Context
+from research_mcp.middleware import TelemetryMiddleware
 from tenacity import RetryError
 
 from research_mcp.db import PaperDB
@@ -51,6 +52,7 @@ def create_mcp(
 
     mcp = FastMCP(
         "research",
+        middleware=[TelemetryMiddleware()],
         instructions=(
             "Research paper discovery and corpus management via Semantic Scholar.\n\n"
             "Workflow:\n"
