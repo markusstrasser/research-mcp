@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
 from fastmcp import FastMCP, Context
+from mcp.types import ToolAnnotations
 from research_mcp.middleware import TelemetryMiddleware
 from tenacity import RetryError
 
@@ -27,6 +28,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_DATA_DIR = Path(__file__).parent.parent.parent / "data"
 DEFAULT_SELVE_ROOT = Path.home() / "Projects" / "selve"
+
+# -- Annotation presets --
+_RO = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=True)
+_RO_LOCAL = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
+_WRITE = ToolAnnotations(readOnlyHint=False, idempotentHint=True, openWorldHint=False)
 
 
 def create_mcp(
@@ -81,7 +87,9 @@ def create_mcp(
         lifespan=lifespan,
     )
 
-    @mcp.tool()
+    # ── Discovery ────────────────────────────────────────────────
+
+    @mcp.tool(annotations=_RO, tags={"discovery"})
     def search_papers(
         ctx: Context,
         query: str,
@@ -138,261 +146,46 @@ def create_mcp(
         log.debug("search_papers used backend=%s, %d results", used_backend, len(results))
         return results
 
-    @mcp.tool()
-    def save_paper(ctx: Context, paper_id: str) -> dict:
-        """Save a paper to the local corpus by its Semantic Scholar paper ID.
-
-        Use after search_papers to persist interesting results. Fetches full
-        metadata from S2 and stores locally.
-        """
-        s2 = ctx.lifespan_context["s2"]
-        db = ctx.lifespan_context["db"]
-        try:
-            paper = s2.get_paper(paper_id)
-        except RetryError as e:
-            cause = e.last_attempt.exception() if e.last_attempt else e
-            log.warning("S2 get_paper failed after retries: %s", cause)
-            return {"error": f"Semantic Scholar rate-limited or unavailable. ({cause})"}
-        if paper is None:
-            return {"error": f"Paper {paper_id} not found on Semantic Scholar"}
-        db.upsert_paper(paper)
-        return {"saved": paper["title"], "paper_id": paper["paper_id"]}
-
-    @mcp.tool()
-    def fetch_paper(
-        ctx: Context,
-        paper_id: str | None = None,
-        doi: str | None = None,
-        url: str | None = None,
-    ) -> dict:
-        """Download a paper's PDF and extract full text.
-
-        Tries Sci-Hub first (most reliable for paywalled papers), then OA.
-        The paper must be saved to the corpus first (via save_paper), OR
-        provide a DOI/URL directly.
-
-        Args:
-            paper_id: Semantic Scholar paper ID (must be in corpus already).
-            doi: DOI to download directly (will also save to corpus).
-            url: Direct PDF URL to download.
-        """
-        db = ctx.lifespan_context["db"]
-        pdir = ctx.lifespan_context["pdf_dir"]
-        s2 = ctx.lifespan_context["s2"]
-
-        # Resolve DOI
-        resolved_doi = doi
-        target_paper_id = paper_id
-
-        if paper_id and not doi:
-            paper = db.get_paper(paper_id)
-            if paper is None:
-                return {"error": f"Paper {paper_id} not in corpus. Use save_paper first."}
-            resolved_doi = paper.get("doi")
-            if not resolved_doi and not url:
-                oa_url = paper.get("open_access_url")
-                if oa_url:
-                    url = oa_url
-                else:
-                    return {"error": f"Paper {paper_id} has no DOI or OA URL."}
-
-        if doi and not paper_id:
-            # Search S2 for the DOI, save it
-            results = s2.search(doi, limit=1)
-            if results:
-                target_paper_id = results[0]["paper_id"]
-                db.upsert_paper(results[0])
-            else:
-                target_paper_id = doi.replace("/", "_")
-                db.upsert_paper({"paper_id": target_paper_id, "doi": doi, "title": f"DOI: {doi}"})
-
-        # Download PDF
-        pdf_path = None
-        if resolved_doi:
-            pdf_path = download_paper(resolved_doi, pdir)
-        if not pdf_path and url:
-            pdf_path = download_url(url, pdir)
-
-        if not pdf_path:
-            return {"error": f"Could not download PDF for doi={resolved_doi} url={url}"}
-
-        # Extract text
-        full_text = extract_text(pdf_path)
-        if not full_text.strip():
-            return {"error": f"PDF downloaded but no text extractable: {pdf_path.name}"}
-
-        # Store in DB
-        if target_paper_id:
-            db.update_paper_pdf(target_paper_id, str(pdf_path), full_text)
-
-        chars = len(full_text)
-        est_tokens = chars // 4
-        return {
-            "paper_id": target_paper_id,
-            "pdf": pdf_path.name,
-            "size_mb": round(pdf_path.stat().st_size / 1_048_576, 1),
-            "text_chars": chars,
-            "est_tokens": est_tokens,
-            "preview": full_text[:500] + "..." if chars > 500 else full_text,
-        }
-
-    @mcp.tool()
-    def read_paper(ctx: Context, paper_id: str) -> dict:
-        """Get full extracted text of a paper. Must have been fetched first."""
-        db = ctx.lifespan_context["db"]
-        paper = db.get_paper(paper_id)
-        if paper is None:
-            return {"error": f"Paper {paper_id} not in corpus"}
-        if not paper.get("full_text"):
-            return {"error": f"Paper {paper_id} has no full text. Use fetch_paper first."}
-        return {
-            "paper_id": paper["paper_id"],
-            "title": paper["title"],
-            "text": paper["full_text"],
-            "chars": len(paper["full_text"]),
-        }
-
-    @mcp.tool()
-    async def ask_papers(
-        ctx: Context,
-        question: str,
-        paper_ids: list[str] | None = None,
-        model: str | None = None,
-        use_rcs: bool = False,
-    ) -> dict:
-        """Ask a question against full-text papers using Gemini's 1M context.
-
-        Two modes:
-        - Default (use_rcs=False): stuffs full paper texts into context (CAG).
-        - RCS (use_rcs=True): scores chunks for relevance first, then synthesizes
-          only the relevant evidence. Higher quality for focused questions.
-
-        Args:
-            question: Research question. Be specific for best results.
-            paper_ids: Optional list of paper IDs to query. If None, uses all papers with text.
-            model: Override model (e.g. 'gemini-3-flash-preview').
-            use_rcs: If True, score chunks for relevance before synthesis (slower but more focused).
-        """
-        db = ctx.lifespan_context["db"]
-        papers = db.get_papers_with_text(paper_ids)
-        if not papers:
-            return {"error": "No papers with full text. Use fetch_paper to download PDFs first."}
-
-        if use_rcs:
-            evidence = await prepare_evidence_async(question, papers)
-            if not evidence:
-                return {"error": "No relevant evidence found after RCS scoring."}
-            return ask_corpus_rcs(question, evidence, model=model)
-
-        return ask_corpus(question, papers, model=model)
-
-    @mcp.tool()
-    def get_paper(ctx: Context, paper_id: str) -> dict:
-        """Get full details of a saved paper from the local corpus."""
-        db = ctx.lifespan_context["db"]
-        paper = db.get_paper(paper_id)
-        if paper is None:
-            return {"error": f"Paper {paper_id} not in local corpus"}
-        return paper
-
-    @mcp.tool()
-    def list_corpus(ctx: Context, limit: int = 50) -> list[dict]:
-        """List papers saved in the local corpus, newest-saved first."""
-        db = ctx.lifespan_context["db"]
-        papers = db.list_papers(limit=limit)
-        return [
-            {
-                "paper_id": p["paper_id"],
-                "title": p["title"],
-                "year": p.get("year"),
-                "citations": p.get("citation_count"),
-            }
-            for p in papers
-        ]
-
-    @mcp.tool()
-    def export_for_selve(ctx: Context) -> dict:
-        """Export corpus to selve-compatible JSON for embedding.
-
-        After calling this, run ./selve update to embed papers into the unified index.
-        Then search with: ./selve search "query" -s papers
-        """
-        db = ctx.lifespan_context["db"]
-        sr = ctx.lifespan_context["selve_root"]
-        entries = db.export_for_selve()
-        out = sr / "interpreted" / "research_papers_export.json"
-        out.write_text(json.dumps({"entries": entries}, indent=2))
-        return {"exported": len(entries), "path": str(out)}
-
-    @mcp.tool()
-    def save_source(ctx: Context, url: str, title: str, content: str) -> dict:
-        """Archive a web source (blog post, docs, news article) with its content.
-
-        Use after fetching a URL via WebFetch/Exa to persist it for later retrieval.
-        Automatically extracts domain and computes content hash.
-
-        Args:
-            url: The source URL.
-            title: Page title.
-            content: The fetched content (markdown or plain text).
-        """
-        db = ctx.lifespan_context["db"]
-        domain = urlparse(url).netloc
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        db.save_source(url, title, domain, content, content_hash)
-        return {"url": url, "title": title, "domain": domain, "chars": len(content)}
-
-    @mcp.tool()
-    def get_source(ctx: Context, url: str) -> dict:
-        """Retrieve an archived web source by URL."""
-        db = ctx.lifespan_context["db"]
-        source = db.get_source(url)
-        if source is None:
-            return {"error": f"Source not archived: {url}"}
-        return source
-
-    @mcp.tool()
-    def list_sources(ctx: Context, limit: int = 50, domain: str | None = None) -> list[dict]:
-        """List archived web sources, newest first.
-
-        Args:
-            limit: Max results (default 50).
-            domain: Optional domain filter (e.g. "arxiv.org").
-        """
-        db = ctx.lifespan_context["db"]
-        return db.list_sources(limit=limit, domain=domain)
-
-    @mcp.tool()
-    async def prepare_evidence(
+    @mcp.tool(annotations=_RO, tags={"discovery"})
+    def search_preprints(
         ctx: Context,
         query: str,
-        paper_ids: list[str] | None = None,
-        min_score: float = 3.0,
-    ) -> dict:
-        """Score paper text chunks for relevance to a research question (RCS).
+        server: str = "biorxiv",
+        days: int = 7,
+        category: str | None = None,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Search bioRxiv/medRxiv for recent preprints matching keywords.
 
-        Chunks each paper's full text, scores via Gemini Flash, returns sorted
-        summaries with relevance scores. PaperQA2 ablation showed removing this
-        step drops accuracy (p<0.001). Use before ask_papers for better synthesis.
+        The bioRxiv API supports date-range browsing. Keywords are matched
+        client-side against title and abstract (all terms must appear).
+
+        Use this for preprint surveillance — finding new papers in the last
+        N days on a topic. For comprehensive literature search, use search_papers
+        (Semantic Scholar) instead.
 
         Args:
-            query: Research question to score relevance against.
-            paper_ids: Papers to process. If None, uses all papers with text.
-            min_score: Minimum relevance score (0-10) to include. Default 3.
+            query: Keywords to match in title/abstract. Space-separated terms
+                   are ANDed. Empty string returns all papers in the date range.
+            server: "biorxiv" or "medrxiv".
+            days: Days to look back (default 7).
+            category: Optional bioRxiv/medRxiv category filter (e.g. "genomics",
+                      "bioinformatics", "genetics", "genetic and genomic medicine").
+            max_results: Max papers to return (default 20).
         """
-        db = ctx.lifespan_context["db"]
-        papers = db.get_papers_with_text(paper_ids)
-        if not papers:
-            return {"error": "No papers with full text. Use fetch_paper first."}
-        evidence = await prepare_evidence_async(query, papers, min_score=min_score)
-        return {
-            "query": query,
-            "papers_processed": len(papers),
-            "evidence_chunks": len(evidence),
-            "evidence": evidence,
-        }
+        results = _search_preprints(
+            query,
+            server=server,
+            days=days,
+            category=category,
+            max_results=max_results,
+        )
+        for r in results:
+            if r.get("abstract") and len(r["abstract"]) > 300:
+                r["abstract"] = r["abstract"][:300] + "..."
+        return results
 
-    @mcp.tool()
+    @mcp.tool(annotations=_RO, tags={"discovery"})
     def traverse_citations(
         ctx: Context,
         paper_ids: list[str],
@@ -476,7 +269,227 @@ def create_mcp(
             ],
         }
 
-    @mcp.tool()
+    # ── Corpus management ────────────────────────────────────────
+
+    @mcp.tool(annotations=_WRITE, tags={"corpus"})
+    def save_paper(ctx: Context, paper_id: str) -> dict:
+        """Save a paper to the local corpus by its Semantic Scholar paper ID.
+
+        Use after search_papers to persist interesting results. Fetches full
+        metadata from S2 and stores locally.
+        """
+        s2 = ctx.lifespan_context["s2"]
+        db = ctx.lifespan_context["db"]
+        try:
+            paper = s2.get_paper(paper_id)
+        except RetryError as e:
+            cause = e.last_attempt.exception() if e.last_attempt else e
+            log.warning("S2 get_paper failed after retries: %s", cause)
+            return {"error": f"Semantic Scholar rate-limited or unavailable. ({cause})"}
+        if paper is None:
+            return {"error": f"Paper {paper_id} not found on Semantic Scholar"}
+        db.upsert_paper(paper)
+        return {"saved": paper["title"], "paper_id": paper["paper_id"]}
+
+    @mcp.tool(annotations=_WRITE, tags={"corpus"})
+    def fetch_paper(
+        ctx: Context,
+        paper_id: str | None = None,
+        doi: str | None = None,
+        url: str | None = None,
+    ) -> dict:
+        """Download a paper's PDF and extract full text.
+
+        Tries Sci-Hub first (most reliable for paywalled papers), then OA.
+        The paper must be saved to the corpus first (via save_paper), OR
+        provide a DOI/URL directly.
+
+        Args:
+            paper_id: Semantic Scholar paper ID (must be in corpus already).
+            doi: DOI to download directly (will also save to corpus).
+            url: Direct PDF URL to download.
+        """
+        db = ctx.lifespan_context["db"]
+        pdir = ctx.lifespan_context["pdf_dir"]
+        s2 = ctx.lifespan_context["s2"]
+
+        # Resolve DOI
+        resolved_doi = doi
+        target_paper_id = paper_id
+
+        if paper_id and not doi:
+            paper = db.get_paper(paper_id)
+            if paper is None:
+                return {"error": f"Paper {paper_id} not in corpus. Use save_paper first."}
+            resolved_doi = paper.get("doi")
+            if not resolved_doi and not url:
+                oa_url = paper.get("open_access_url")
+                if oa_url:
+                    url = oa_url
+                else:
+                    return {"error": f"Paper {paper_id} has no DOI or OA URL."}
+
+        if doi and not paper_id:
+            # Search S2 for the DOI, save it
+            results = s2.search(doi, limit=1)
+            if results:
+                target_paper_id = results[0]["paper_id"]
+                db.upsert_paper(results[0])
+            else:
+                target_paper_id = doi.replace("/", "_")
+                db.upsert_paper({"paper_id": target_paper_id, "doi": doi, "title": f"DOI: {doi}"})
+
+        # Download PDF
+        pdf_path = None
+        if resolved_doi:
+            pdf_path = download_paper(resolved_doi, pdir)
+        if not pdf_path and url:
+            pdf_path = download_url(url, pdir)
+
+        if not pdf_path:
+            return {"error": f"Could not download PDF for doi={resolved_doi} url={url}"}
+
+        # Extract text
+        full_text = extract_text(pdf_path)
+        if not full_text.strip():
+            return {"error": f"PDF downloaded but no text extractable: {pdf_path.name}"}
+
+        # Store in DB
+        if target_paper_id:
+            db.update_paper_pdf(target_paper_id, str(pdf_path), full_text)
+
+        chars = len(full_text)
+        est_tokens = chars // 4
+        return {
+            "paper_id": target_paper_id,
+            "pdf": pdf_path.name,
+            "size_mb": round(pdf_path.stat().st_size / 1_048_576, 1),
+            "text_chars": chars,
+            "est_tokens": est_tokens,
+            "preview": full_text[:500] + "..." if chars > 500 else full_text,
+        }
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"corpus"})
+    def read_paper(ctx: Context, paper_id: str) -> dict:
+        """Get full extracted text of a paper. Must have been fetched first."""
+        db = ctx.lifespan_context["db"]
+        paper = db.get_paper(paper_id)
+        if paper is None:
+            return {"error": f"Paper {paper_id} not in corpus"}
+        if not paper.get("full_text"):
+            return {"error": f"Paper {paper_id} has no full text. Use fetch_paper first."}
+        return {
+            "paper_id": paper["paper_id"],
+            "title": paper["title"],
+            "text": paper["full_text"],
+            "chars": len(paper["full_text"]),
+        }
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"corpus"})
+    def get_paper(ctx: Context, paper_id: str) -> dict:
+        """Get full details of a saved paper from the local corpus."""
+        db = ctx.lifespan_context["db"]
+        paper = db.get_paper(paper_id)
+        if paper is None:
+            return {"error": f"Paper {paper_id} not in local corpus"}
+        return paper
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"corpus"})
+    def list_corpus(ctx: Context, limit: int = 50) -> list[dict]:
+        """List papers saved in the local corpus, newest-saved first."""
+        db = ctx.lifespan_context["db"]
+        papers = db.list_papers(limit=limit)
+        return [
+            {
+                "paper_id": p["paper_id"],
+                "title": p["title"],
+                "year": p.get("year"),
+                "citations": p.get("citation_count"),
+            }
+            for p in papers
+        ]
+
+    @mcp.tool(annotations=_WRITE, tags={"corpus"})
+    def export_for_selve(ctx: Context) -> dict:
+        """Export corpus to selve-compatible JSON for embedding.
+
+        After calling this, run ./selve update to embed papers into the unified index.
+        Then search with: ./selve search "query" -s papers
+        """
+        db = ctx.lifespan_context["db"]
+        sr = ctx.lifespan_context["selve_root"]
+        entries = db.export_for_selve()
+        out = sr / "interpreted" / "research_papers_export.json"
+        out.write_text(json.dumps({"entries": entries}, indent=2))
+        return {"exported": len(entries), "path": str(out)}
+
+    # ── Synthesis ────────────────────────────────────────────────
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"synthesis"})
+    async def ask_papers(
+        ctx: Context,
+        question: str,
+        paper_ids: list[str] | None = None,
+        model: str | None = None,
+        use_rcs: bool = False,
+    ) -> dict:
+        """Ask a question against full-text papers using Gemini's 1M context.
+
+        Two modes:
+        - Default (use_rcs=False): stuffs full paper texts into context (CAG).
+        - RCS (use_rcs=True): scores chunks for relevance first, then synthesizes
+          only the relevant evidence. Higher quality for focused questions.
+
+        Args:
+            question: Research question. Be specific for best results.
+            paper_ids: Optional list of paper IDs to query. If None, uses all papers with text.
+            model: Override model (e.g. 'gemini-3-flash-preview').
+            use_rcs: If True, score chunks for relevance before synthesis (slower but more focused).
+        """
+        db = ctx.lifespan_context["db"]
+        papers = db.get_papers_with_text(paper_ids)
+        if not papers:
+            return {"error": "No papers with full text. Use fetch_paper to download PDFs first."}
+
+        if use_rcs:
+            evidence = await prepare_evidence_async(question, papers)
+            if not evidence:
+                return {"error": "No relevant evidence found after RCS scoring."}
+            return ask_corpus_rcs(question, evidence, model=model)
+
+        return ask_corpus(question, papers, model=model)
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"synthesis"})
+    async def prepare_evidence(
+        ctx: Context,
+        query: str,
+        paper_ids: list[str] | None = None,
+        min_score: float = 3.0,
+    ) -> dict:
+        """Score paper text chunks for relevance to a research question (RCS).
+
+        Chunks each paper's full text, scores via Gemini Flash, returns sorted
+        summaries with relevance scores. PaperQA2 ablation showed removing this
+        step drops accuracy (p<0.001). Use before ask_papers for better synthesis.
+
+        Args:
+            query: Research question to score relevance against.
+            paper_ids: Papers to process. If None, uses all papers with text.
+            min_score: Minimum relevance score (0-10) to include. Default 3.
+        """
+        db = ctx.lifespan_context["db"]
+        papers = db.get_papers_with_text(paper_ids)
+        if not papers:
+            return {"error": "No papers with full text. Use fetch_paper first."}
+        evidence = await prepare_evidence_async(query, papers, min_score=min_score)
+        return {
+            "query": query,
+            "papers_processed": len(papers),
+            "evidence_chunks": len(evidence),
+            "evidence": evidence,
+        }
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"synthesis"})
     async def extract_table(
         ctx: Context,
         paper_ids: list[str],
@@ -512,7 +525,49 @@ def create_mcp(
             "rows": rows,
         }
 
-    @mcp.tool()
+    # ── Web sources ──────────────────────────────────────────────
+
+    @mcp.tool(annotations=_WRITE, tags={"sources"})
+    def save_source(ctx: Context, url: str, title: str, content: str) -> dict:
+        """Archive a web source (blog post, docs, news article) with its content.
+
+        Use after fetching a URL via WebFetch/Exa to persist it for later retrieval.
+        Automatically extracts domain and computes content hash.
+
+        Args:
+            url: The source URL.
+            title: Page title.
+            content: The fetched content (markdown or plain text).
+        """
+        db = ctx.lifespan_context["db"]
+        domain = urlparse(url).netloc
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+        db.save_source(url, title, domain, content, content_hash)
+        return {"url": url, "title": title, "domain": domain, "chars": len(content)}
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"sources"})
+    def get_source(ctx: Context, url: str) -> dict:
+        """Retrieve an archived web source by URL."""
+        db = ctx.lifespan_context["db"]
+        source = db.get_source(url)
+        if source is None:
+            return {"error": f"Source not archived: {url}"}
+        return source
+
+    @mcp.tool(annotations=_RO_LOCAL, tags={"sources"})
+    def list_sources(ctx: Context, limit: int = 50, domain: str | None = None) -> list[dict]:
+        """List archived web sources, newest first.
+
+        Args:
+            limit: Max results (default 50).
+            domain: Optional domain filter (e.g. "arxiv.org").
+        """
+        db = ctx.lifespan_context["db"]
+        return db.list_sources(limit=limit, domain=domain)
+
+    # ── Verification ─────────────────────────────────────────────
+
+    @mcp.tool(annotations=_RO, tags={"verification"})
     def verify_claim(ctx: Context, claim: str) -> dict:
         """Verify a factual claim against web sources via Exa /answer.
 
@@ -537,46 +592,6 @@ def create_mcp(
             }
 
         return exa_verify_claim(claim, exa, db=db)
-
-    @mcp.tool()
-    def search_preprints(
-        ctx: Context,
-        query: str,
-        server: str = "biorxiv",
-        days: int = 7,
-        category: str | None = None,
-        max_results: int = 20,
-    ) -> list[dict]:
-        """Search bioRxiv/medRxiv for recent preprints matching keywords.
-
-        The bioRxiv API supports date-range browsing. Keywords are matched
-        client-side against title and abstract (all terms must appear).
-
-        Use this for preprint surveillance — finding new papers in the last
-        N days on a topic. For comprehensive literature search, use search_papers
-        (Semantic Scholar) instead.
-
-        Args:
-            query: Keywords to match in title/abstract. Space-separated terms
-                   are ANDed. Empty string returns all papers in the date range.
-            server: "biorxiv" or "medrxiv".
-            days: Days to look back (default 7).
-            category: Optional bioRxiv/medRxiv category filter (e.g. "genomics",
-                      "bioinformatics", "genetics", "genetic and genomic medicine").
-            max_results: Max papers to return (default 20).
-        """
-        results = _search_preprints(
-            query,
-            server=server,
-            days=days,
-            category=category,
-            max_results=max_results,
-        )
-        # Truncate abstracts for readability
-        for r in results:
-            if r.get("abstract") and len(r["abstract"]) > 300:
-                r["abstract"] = r["abstract"][:300] + "..."
-        return results
 
     return mcp
 
