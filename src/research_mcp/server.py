@@ -21,6 +21,7 @@ from research_mcp.cag import ask_corpus, ask_corpus_rcs
 from research_mcp.rcs import prepare_evidence_async
 from research_mcp.extraction import extract_table_async, COLUMN_PRESETS
 from research_mcp.exa_verify import get_exa_client, exa_verify_claim
+from research_mcp.preprints import search_preprints as _search_preprints
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,8 @@ def create_mcp(
             "- save_source — archive a web page (blog post, docs, news) with its content\n"
             "- get_source — retrieve an archived web source by URL\n"
             "- list_sources — browse archived web sources, optionally filter by domain\n\n"
+            "Preprint surveillance:\n"
+            "- search_preprints — search bioRxiv/medRxiv by date range + keywords (free API, no S2 needed)\n\n"
             "Claim verification:\n"
             "- verify_claim — verify a factual claim against web sources (Exa /answer, cached 7 days)"
         ),
@@ -534,6 +537,46 @@ def create_mcp(
             }
 
         return exa_verify_claim(claim, exa, db=db)
+
+    @mcp.tool()
+    def search_preprints(
+        ctx: Context,
+        query: str,
+        server: str = "biorxiv",
+        days: int = 7,
+        category: str | None = None,
+        max_results: int = 20,
+    ) -> list[dict]:
+        """Search bioRxiv/medRxiv for recent preprints matching keywords.
+
+        The bioRxiv API supports date-range browsing. Keywords are matched
+        client-side against title and abstract (all terms must appear).
+
+        Use this for preprint surveillance — finding new papers in the last
+        N days on a topic. For comprehensive literature search, use search_papers
+        (Semantic Scholar) instead.
+
+        Args:
+            query: Keywords to match in title/abstract. Space-separated terms
+                   are ANDed. Empty string returns all papers in the date range.
+            server: "biorxiv" or "medrxiv".
+            days: Days to look back (default 7).
+            category: Optional bioRxiv/medRxiv category filter (e.g. "genomics",
+                      "bioinformatics", "genetics", "genetic and genomic medicine").
+            max_results: Max papers to return (default 20).
+        """
+        results = _search_preprints(
+            query,
+            server=server,
+            days=days,
+            category=category,
+            max_results=max_results,
+        )
+        # Truncate abstracts for readability
+        for r in results:
+            if r.get("abstract") and len(r["abstract"]) > 300:
+                r["abstract"] = r["abstract"][:300] + "..."
+        return results
 
     return mcp
 
