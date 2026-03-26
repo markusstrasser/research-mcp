@@ -21,7 +21,7 @@ from research_mcp.papers import download_paper, download_url, extract_text
 from research_mcp.cag import ask_corpus, ask_corpus_rcs
 from research_mcp.rcs import prepare_evidence_async
 from research_mcp.extraction import extract_table_async, COLUMN_PRESETS
-from research_mcp.exa_verify import get_exa_client, exa_verify_claim
+from research_mcp.exa_verify import get_exa_client, exa_verify_claim, exa_verify_with_quote
 from research_mcp.preprints import search_preprints as _search_preprints
 from research_mcp.deep_research import (
     run_deep_research as _run_deep_research,
@@ -599,6 +599,35 @@ def create_mcp(
             }
 
         return exa_verify_claim(claim, exa, db=db)
+
+    @mcp.tool(annotations=_RO, tags={"verification"})
+    def verify_claim_with_quote(ctx: Context, claim: str, source_url: str) -> dict:
+        """Verify a claim against a specific source URL, extracting the supporting quote.
+
+        Quote-anchored verification: checks whether a specific source supports the
+        claim and returns the exact quote. More auditable than general verify_claim.
+        Use when the claim has an attributed source (e.g. tagged [SOURCE: url]).
+
+        Args:
+            claim: The factual claim to verify.
+            source_url: The URL the claim is attributed to.
+        """
+        exa = ctx.lifespan_context.get("exa")
+        db = ctx.lifespan_context["db"]
+
+        if exa is None:
+            return {
+                "verdict": "insufficient",
+                "supporting_quote": "",
+                "evidence_summary": "Exa not configured — set EXA_API_KEY environment variable",
+                "confidence": 0.0,
+                "citations": [],
+                "cost_dollars": None,
+                "cached": False,
+                "error": "no_api_key",
+            }
+
+        return exa_verify_with_quote(claim, source_url, exa, db=db)
 
     # ── Deep Research ─────────────────────────────────────────────
 
